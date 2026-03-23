@@ -1,0 +1,30 @@
+[project]
+name = "iris-control-center"
+version = "0.1.0"
+description = ""
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Flet developer", email = "you@example.com" }
+]
+dependencies = [
+    "flet>=0.82.2",
+    "kokoro-onnx>=0.5.0",
+    "sounddevice>=0.5.5",
+]
+
+[dependency-groups]
+dev = [
+    "flet-cli>=0.82.2",
+    "flet-desktop>=0.82.2",
+    "flet-web>=0.82.2",
+]
+
+[tool.flet]
+org = "com.mycompany"
+product = "iris-configurator"
+company = "Flet"
+copyright = "Copyright (C) 2023-2026 by Flet"
+
+[tool.flet.app]
+path = "src"
