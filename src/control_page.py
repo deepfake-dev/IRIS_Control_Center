@@ -3,15 +3,25 @@ import sounddevice as sd
 from kokoro_onnx import Kokoro
 import datetime
 import os
+import sqlite3
 import subprocess
 import threading
-from pathlib import Path
+import flet_code_editor as fce
+from mappings import *
+
+import pandas as pd
+
+import lancedb
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import LanceDB
+from langchain_experimental.text_splitter import SemanticChunker
 
 # ── Active server processes ───────────────────────────────────────────────────
 _processes: dict[str, subprocess.Popen] = {}
 _log_threads: list[threading.Thread] = []
 
 def ControlPage(page: ft.Page):
+    db_path = os.getenv("DATABASE_URL")
     log_view = ft.ListView(expand=True, auto_scroll=True, spacing=4)
 
     def write_log(message: str, is_error: bool = False):
@@ -55,36 +65,101 @@ def ControlPage(page: ft.Page):
 
     doc_list_view = ft.ListView(expand=True, scroll=ft.ScrollMode.AUTO)
 
-    def remove_document(e, tile_ref):
-        doc_list_view.controls.remove(tile_ref)
-        write_log(f"Removed document: {tile_ref.title.value}")
-        check_ready()
-        page.update()
+    def show_content(e, tile: ft.ListTile, row: dict):
+        dialog = ft.AlertDialog(
+            title=ft.Text(tile.title.value),
+            content=fce.CodeEditor(
+                language=fce.CodeLanguage.MARKDOWN,
+                code_theme=fce.CodeTheme.SOLARIZED_DARK,
+                expand=True,
+                read_only=True,
+                value=row["request_md"]
+            ),
+            alignment=ft.Alignment.CENTER,
+        )
+        page.show_dialog(dialog)
+    
+    def mark_merge(e, tile: ft.ListTile, row: dict):
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            UPDATE requests 
+            SET status_merged = ? 
+            WHERE id = ?
+        ''', (1, int(row["id"])))
 
-    def add_tile(file: ft.FilePickerFile):
+        page.pop_dialog()
+        
+        if cursor.rowcount == 0:
+            page.show_dialog(ft.SnackBar(ft.Text("Failed to update nonexistent.")))
+        else:
+            page.show_dialog(ft.SnackBar(ft.Text(f"Success: Request {row["id"]} updated to status {row["id"]}.")))
+            
+        conn.commit()
+        conn.close()
+
+        retrieve_embeddings()
+    
+    def ask_merge(e, tile: ft.ListTile, row: dict):
+        modal_dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Please confirm"),
+            content=ft.Text("Do you really want to mark this row as merged? You need to rebuild index after to reflect the changes."),
+            actions=[
+                ft.TextButton("Yes", on_click=lambda e, t=tile, r=row: mark_merge(e, t, r)),
+                ft.TextButton("No", on_click=lambda e: page.pop_dialog()),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        page.show_dialog(modal_dialog)
+
+    def add_tile(row: dict):
+        name = f"Entry: {info_type_mapping[row["info_type"]]} | {office_mapping[row["office"]]} | {target_mapping[row["target"]]}"
         tile = ft.ListTile(
-            title=ft.Text(file.name, weight=ft.FontWeight.BOLD),
-            subtitle=ft.Text(file.path),
+            title=ft.Text(name, weight=ft.FontWeight.BOLD),
+            subtitle=ft.Text("Merged" if bool(row["status_merged"]) else "Waiting"),
             leading=ft.Icon(ft.Icons.FOLDER_OUTLINED),
         )
-        del_btn = ft.IconButton(
-            icon=ft.Icons.DELETE,
-            on_click=lambda e, t=tile: remove_document(e, t)
+
+        view_btn = ft.IconButton(
+            icon=ft.Icons.VISIBILITY_OUTLINED,
+            on_click=lambda e, t=tile, r=row: show_content(e, t, r)
         )
-        tile.trailing = del_btn
+
+        controls = [view_btn]
+        width = 32
+
+        if not bool(row["status_merged"]):
+            controls.append(
+                ft.IconButton(
+                    icon=ft.Icons.MERGE_OUTLINED,
+                    on_click=lambda e, t=tile, r=row: ask_merge(e, t, r)
+                )
+            )
+            width = 72
+
+        tile.trailing = ft.Row(controls, width=width)
         doc_list_view.controls.append(tile)
 
-    async def pick_files():
-        files = await ft.FilePicker().pick_files(
-            allow_multiple=True,
-            allowed_extensions=["pdf", "docx", "png", "jpg"]
-        )
-        if files:
-            for f in files:
-                add_tile(f)
-                write_log(f"Added document: {f.name}")
-            check_ready()
-            page.update()
+    def retrieve_embeddings(e = None):
+        doc_list_view.controls = []
+        conn = sqlite3.connect(db_path)
+        
+        conn.row_factory = sqlite3.Row 
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT * FROM requests 
+            ORDER BY status_merged ASC, id DESC
+        ''')
+        
+        results = cursor.fetchall()
+        conn.close()
+        
+        for row in results:
+            result = dict(row)
+            add_tile(result)
 
     # ── Ready check ───────────────────────────────────────────────────────────
 
@@ -130,11 +205,6 @@ def ControlPage(page: ft.Page):
         global _processes, _log_threads
         _log_threads.clear()
 
-        # Collect docs as a space-separated list of paths for the RAG indexer
-        doc_paths = " ".join(
-            f'"{t.subtitle.value}"' for t in doc_list_view.controls
-        )
-
         servers = [
             {
                 "name": "KIOSK",
@@ -172,8 +242,6 @@ def ControlPage(page: ft.Page):
                 ],
                 "note": f"VLM expected on port {vlm_port_tf.value} — start llama-server manually.",
             },
-            # .\llama-server.exe --alias qwen3-vl-instruct --model C:\Users\owen\Desktop\llamacpp\ggufs\Qwen3VL-4B-Instruct-Q4_K_M.gguf --mmproj C:/Users/owen/Desktop/llamacpp/ggufs/mmproj-Qwen3VL-4B-Instruct-F16.gguf
-            # --n-gpu-layers 99 --ctx-size 32768 --port 8001 --no-mmap
         ]
 
         for srv in servers:
@@ -227,10 +295,113 @@ def ControlPage(page: ft.Page):
             stop_servers()
 
     def update_index(e):
-        write_log("Refreshing document index...")
-        check_ready()
+        write_log("Starting safe database update... This may take a minute.")
+        
+        build_progress.visible = True
+        build_button.disabled = True
+        page.update()
+        
+        def _build_task():
+            try:
+                # 1. Fetch from SQLite
+                conn = sqlite3.connect(db_path)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM requests WHERE status_merged = 1")
+                rows = cursor.fetchall()
+                conn.close()
+
+                if not rows:
+                    write_log("No merged documents found to index.", is_error=True)
+                    return
+
+                write_log(f"Found {len(rows)} merged documents. Chunking...")
+                
+                # 2. Chunking
+                embedder = HuggingFaceEmbeddings(
+                    model_name="nomic-ai/nomic-embed-text-v1.5",
+                    model_kwargs={'device': 'cpu', 'trust_remote_code': True}
+                )
+                chunker = SemanticChunker(embedder)
+                
+                new_chunks = []
+                doc_ids_to_update = []
+                
+                for row in rows:
+                    md_text = row["request_md"]
+                    doc_id_str = str(row["id"])
+                    doc_ids_to_update.append(doc_id_str)
+                    
+                    meta = {
+                        "doc_id": doc_id_str,
+                        "source": info_type_mapping.get(row["info_type"], "Unknown"),
+                        "office": office_mapping.get(row["office"], "Unknown"),
+                        "target": target_mapping.get(row["target"], "Unknown")
+                    }
+                    new_chunks.extend(chunker.create_documents([md_text], metadatas=[meta]))
+
+                write_log(f"Generated {len(new_chunks)} new chunks. Embedding them now...")
+
+                # 3. Generate vectors manually ONLY for the new chunks
+                texts = [chunk.page_content for chunk in new_chunks]
+                vectors = embedder.embed_documents(texts)
+                
+                new_records = []
+                for i, chunk in enumerate(new_chunks):
+                    record = {
+                        "vector": vectors[i],
+                        "text": chunk.page_content,
+                    }
+                    record.update(chunk.metadata) # Add metadata fields
+                    new_records.append(record)
+
+                # 4. Safe Pandas Merge
+                lance_db_path = os.getenv("LANCEDB_URL")
+                db = lancedb.connect(lance_db_path)
+                table_name = "batstateu_rag_nomic"
+                
+                if table_name in db.table_names():
+                    write_log("Merging with existing database...")
+                    table = db.open_table(table_name)
+                    df_old = table.to_pandas()
+                    
+                    # Clean up old versions ONLY if 'doc_id' exists in the old schema
+                    if "doc_id" in df_old.columns:
+                        # Convert to string safely to avoid NaN errors, then filter out the matches
+                        df_old['doc_id_safe'] = df_old['doc_id'].fillna('').astype(str)
+                        df_old = df_old[~df_old['doc_id_safe'].isin(doc_ids_to_update)]
+                        df_old = df_old.drop(columns=['doc_id_safe'])
+                        
+                    df_new = pd.DataFrame(new_records)
+                    
+                    # Concat automatically aligns columns and fills missing metadata with NaN
+                    merged_df = pd.concat([df_old, df_new], ignore_index=True)
+                    
+                    # Overwrite the table with the newly unified schema and data
+                    db.create_table(table_name, data=merged_df, mode="overwrite")
+                else:
+                    write_log("Creating new database table...")
+                    db.create_table(table_name, data=new_records)
+                
+                write_log("✅ Database updated! Your other information was preserved.")
+
+            except Exception as exc:
+                write_log(f"Index rebuild failed: {exc}", is_error=True)
+                
+            finally:
+                build_progress.visible = False
+                build_button.disabled = False
+                try:
+                    page.update()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_build_task, daemon=True).start()
 
     # ── Controls ──────────────────────────────────────────────────────────────
+
+    build_progress = ft.ProgressRing(width=16, height=16, stroke_width=2, visible=False)
+    build_button = ft.IconButton(icon=ft.Icons.BUILD_OUTLINED, on_click=update_index)
 
     start_switch = ft.Switch(
         label="Toggle IRIS System",
@@ -354,10 +525,11 @@ def ControlPage(page: ft.Page):
                                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                                     expand=True,
                                     controls=[
-                                        ft.Text("Embedded Documents", size=20, weight=ft.FontWeight.W_600),
+                                        ft.Text("Embedding Documents", size=20, weight=ft.FontWeight.W_600),
                                         ft.Row([
-                                            ft.IconButton(icon=ft.Icons.ADD_OUTLINED, on_click=pick_files),
-                                            ft.IconButton(icon=ft.Icons.UPDATE_OUTLINED, on_click=update_index),
+                                            ft.IconButton(icon=ft.Icons.REFRESH_OUTLINED, on_click=retrieve_embeddings),
+                                            build_progress,
+                                            build_button,
                                         ]),
                                     ],
                                 ),
@@ -424,9 +596,7 @@ def ControlPage(page: ft.Page):
 
     # Seed with demo docs
     write_log("System initialized. Awaiting user input...")
-    add_tile(ft.FilePickerFile(0, "BROCHURE.pdf", size=652000, path="C:/Users/owen/Downloads/BROCHURE.pdf"))
-    add_tile(ft.FilePickerFile(1, "OSD manual FINAL.pdf", size=652000, path="C:/Users/owen/Downloads/OSD manual FINAL.pdf"))
-    add_tile(ft.FilePickerFile(2, "BatStateU-Citizens-Charter-2025-01-Final.pdf", size=652000, path="C:/Users/owen/Downloads/BatStateU-Citizens-Charter-2025-01-Final.pdf"))
+    retrieve_embeddings()
     check_ready()
 
     write_log(f"Currently in: {os.getcwd()}")

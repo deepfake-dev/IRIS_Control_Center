@@ -1,14 +1,44 @@
 import flet as ft
+import sqlite3
+import os
 
 def LoginPage(page: ft.Page):
+    db_path = os.getenv("DATABASE_URL")
     async def push_to_ctrl():
         await page.push_route("/control")
     
+    def login(univ_code, password):
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT from_ict 
+            FROM users 
+            WHERE user_code = ? AND password = ?
+        ''', (univ_code, password))
+        
+        match = cursor.fetchone()
+        conn.close()
+    
+        if match:
+            return True, bool(match[0])
+        else:
+            return False, None
+    
     async def try_login(e):
-        # result = await login(univ_code_tf.value, password_tf.value)
-        result = True
+        result, from_ict = login(univ_code_tf.value, password_tf.value)
         if result:
-            await push_to_ctrl()
+            if from_ict:
+                await push_to_ctrl()
+            else:
+                dialog = ft.AlertDialog(
+                    title=ft.Text("Cannot log in."),
+                    content=ft.Text("Only ICT can check for merge requests!"),
+                    alignment=ft.Alignment.CENTER,
+                    title_padding=ft.Padding.all(25),
+                )
+
+                page.show_dialog(dialog)
         else:
             dialog = ft.AlertDialog(
                 title=ft.Text("Cannot log in."),

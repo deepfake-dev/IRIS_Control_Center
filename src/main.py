@@ -1,6 +1,9 @@
 import flet as ft
 from login_page import LoginPage
 from control_page import ControlPage
+from dotenv import load_dotenv
+
+load_dotenv()
 
 async def main(page: ft.Page):
     page.title = "IRIS Control Center"
@@ -28,6 +31,8 @@ async def main(page: ft.Page):
 
     page.on_route_change = route_change
     page.on_view_pop = view_pop
+
+    page.route = "/control"
     
     route_change()
     await page.window.center()

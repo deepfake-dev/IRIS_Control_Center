@@ -8,8 +8,18 @@ authors = [
     { name = "Flet developer", email = "you@example.com" }
 ]
 dependencies = [
+    "einops>=0.8.2",
+    "flashrank>=0.2.10",
     "flet>=0.82.2",
+    "flet-code-editor>=0.82.2",
     "kokoro-onnx>=0.5.0",
+    "langchain>=1.2.13",
+    "langchain-community>=0.4.1",
+    "langchain-experimental>=0.4.1",
+    "langchain-huggingface>=1.2.1",
+    "pandas>=2.3.3",
+    "python-dotenv>=1.2.2",
+    "sentence-transformers>=5.3.0",
     "sounddevice>=0.5.5",
 ]
 
