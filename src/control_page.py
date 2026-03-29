@@ -10,6 +10,7 @@ import flet_code_editor as fce
 from mappings import *
 
 import pandas as pd
+import socket
 
 import lancedb
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -164,12 +165,29 @@ def ControlPage(page: ft.Page):
     # ── Ready check ───────────────────────────────────────────────────────────
 
     def check_ready():
+        vlm_ready = False
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0) # 1 second time out
+            try:
+                # connect_ex returns 0 if the connection was successful
+                result = s.connect_ex(('127.0.0.1', int(vlm_port_tf.value)))
+                if result == 0:
+                    vlm_ready = True
+                    write_log(f"VLM is ready at port {int(vlm_port_tf.value)}.")
+                else:
+                    vlm_ready = False
+                    write_log(f"VLM is NOT ready.")
+            except Exception as e:
+                vlm_ready = False
+                write_log(f"VLM is ready: {e}")
+
         ready = all([
             webpage_port_tf.value,
             vlm_port_tf.value,
             provenance_port_tf.value,
             avatar_port_tf.value,
             len(doc_list_view.controls) > 0,
+            vlm_ready
         ])
         start_switch.disabled = not ready
         page.update()
@@ -229,18 +247,6 @@ def ControlPage(page: ft.Page):
                     "--port", provenance_port_tf.value,
                     '--app-dir', f"{os.path.join(os.getcwd(), "scripts", "provenance_checker")}"
                 ],
-            },
-            {
-                "name": "VLM",
-                "color": "#da77f2",   # purple — informational only
-                "cmd": [
-                    './server/llama-server.exe', '--alias', 'qwen3-vl-instruct',
-                    '--model', f"models/vlm/Qwen3VL-2B-Instruct-Q4_K_M.gguf",
-                    '--mmproj', f"models/vlm/mmproj-Qwen3VL-2B-Instruct-F16.gguf",
-                    '--n-gpu-layers', '99', '--ctx-size', '32768',
-                    '--port', vlm_port_tf.value, '--no-mmap'
-                ],
-                "note": f"VLM expected on port {vlm_port_tf.value} — start llama-server manually.",
             },
         ]
 
@@ -315,7 +321,34 @@ def ControlPage(page: ft.Page):
                     write_log("No merged documents found to index.", is_error=True)
                     return
 
-                write_log(f"Found {len(rows)} merged documents. Chunking...")
+                # =========================================================
+                # NEW: Check LanceDB to see what has already been built
+                # =========================================================
+                lance_db_path = os.getenv("LANCEDB_URL")
+                db = lancedb.connect(lance_db_path)
+                table_name = "batstateu_rag_nomic"
+
+                df_old = None
+                existing_doc_ids = set()
+
+                if table_name in db.table_names():
+                    table = db.open_table(table_name)
+                    df_old = table.to_pandas()
+                    
+                    if "doc_id" in df_old.columns:
+                        # Grab all the unique doc_ids currently in LanceDB
+                        existing_doc_ids = set(df_old['doc_id'].fillna('').astype(str).unique())
+
+                # Filter the rows: Only keep documents that are NOT in LanceDB yet
+                rows_to_build = [r for r in rows if str(r["id"]) not in existing_doc_ids]
+
+                if not rows_to_build:
+                    write_log("✅ All merged documents are already indexed. Nothing new to build!")
+                    return
+
+                write_log(f"Found {len(rows_to_build)} NEW merged documents. Chunking...")
+                
+                # =========================================================
                 
                 # 2. Chunking
                 embedder = HuggingFaceEmbeddings(
@@ -325,12 +358,11 @@ def ControlPage(page: ft.Page):
                 chunker = SemanticChunker(embedder)
                 
                 new_chunks = []
-                doc_ids_to_update = []
                 
-                for row in rows:
+                # Iterate ONLY over the new rows
+                for row in rows_to_build:
                     md_text = row["request_md"]
                     doc_id_str = str(row["id"])
-                    doc_ids_to_update.append(doc_id_str)
                     
                     meta = {
                         "doc_id": doc_id_str,
@@ -356,28 +388,12 @@ def ControlPage(page: ft.Page):
                     new_records.append(record)
 
                 # 4. Safe Pandas Merge
-                lance_db_path = os.getenv("LANCEDB_URL")
-                db = lancedb.connect(lance_db_path)
-                table_name = "batstateu_rag_nomic"
-                
-                if table_name in db.table_names():
-                    write_log("Merging with existing database...")
-                    table = db.open_table(table_name)
-                    df_old = table.to_pandas()
-                    
-                    # Clean up old versions ONLY if 'doc_id' exists in the old schema
-                    if "doc_id" in df_old.columns:
-                        # Convert to string safely to avoid NaN errors, then filter out the matches
-                        df_old['doc_id_safe'] = df_old['doc_id'].fillna('').astype(str)
-                        df_old = df_old[~df_old['doc_id_safe'].isin(doc_ids_to_update)]
-                        df_old = df_old.drop(columns=['doc_id_safe'])
-                        
+                if df_old is not None:
+                    write_log("Merging new records with existing database...")
                     df_new = pd.DataFrame(new_records)
                     
-                    # Concat automatically aligns columns and fills missing metadata with NaN
+                    # Simply concat the new records to the old ones (no overlaps exist because we filtered them)
                     merged_df = pd.concat([df_old, df_new], ignore_index=True)
-                    
-                    # Overwrite the table with the newly unified schema and data
                     db.create_table(table_name, data=merged_df, mode="overwrite")
                 else:
                     write_log("Creating new database table...")
