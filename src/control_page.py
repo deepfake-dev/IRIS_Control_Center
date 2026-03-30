@@ -227,10 +227,11 @@ def ControlPage(page: ft.Page):
             {
                 "name": "KIOSK",
                 "color": "#74c0fc",
+                # ---> NEW: Point to our custom HTTPS script <---
                 "cmd": [
-                    "./.venv/Scripts/python.exe", "-m", "http.server",
+                    "./.venv/Scripts/python.exe", "scripts/https_kiosk.py",
                     webpage_port_tf.value,
-                    "--directory", f"{os.path.join(os.getcwd(), "avatar")}"
+                    "--directory", f"{os.path.join(os.getcwd(), 'avatar')}"
                 ],
             },
             {
@@ -245,7 +246,10 @@ def ControlPage(page: ft.Page):
                     "./.venv/Scripts/uvicorn.exe", "server:app",
                     "--host", "0.0.0.0",
                     "--port", provenance_port_tf.value,
-                    '--app-dir', f"{os.path.join(os.getcwd(), "scripts", "provenance_checker")}"
+                    "--app-dir", f"{os.path.join(os.getcwd(), 'scripts', 'provenance_checker')}",
+                    # ---> NEW: Add the SSL certificates here <---
+                    "--ssl-keyfile", "key.pem",
+                    "--ssl-certfile", "cert.pem"
                 ],
             },
         ]
