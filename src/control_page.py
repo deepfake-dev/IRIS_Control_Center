@@ -3,35 +3,57 @@ import sounddevice as sd
 from kokoro_onnx import Kokoro
 import datetime
 import os
-import sqlite3
 import subprocess
 import threading
+import tempfile
+import socket
+import pandas as pd
+
 import flet_code_editor as fce
 from mappings import *
 
-import pandas as pd
-import socket
-
+# Vector DB & Embeddings
 import lancedb
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import LanceDB
-from langchain_experimental.text_splitter import SemanticChunker
+
+# Supabase
+from supabase import create_client, Client
+
+# Docling & Tokenizer
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.chunking import HybridChunker
+from docling.datamodel.pipeline_options import PdfPipelineOptions, TableStructureOptions
+from docling.datamodel.base_models import InputFormat
+from transformers import AutoTokenizer
+
+import pyarrow as pa
+from sentence_transformers import CrossEncoder
 
 # ── Active server processes ───────────────────────────────────────────────────
 _processes: dict[str, subprocess.Popen] = {}
 _log_threads: list[threading.Thread] = []
 
 def ControlPage(page: ft.Page):
-    db_path = os.getenv("DATABASE_URL")
+    # Supabase Setup
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_KEY")
+    
+    def get_supabase() -> Client | None:
+        if not supabase_url or not supabase_key:
+            return None
+        return create_client(supabase_url, supabase_key)
+
     log_view = ft.ListView(expand=True, auto_scroll=True, spacing=4)
 
     def write_log(message: str, is_error: bool = False):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         color = "#ff6b6b" if is_error else "#BDD1D9"
         log_view.controls.append(
-            ft.Text(f"[{timestamp}] {message}", color=color, font_family="JetBrains Mono")
+            ft.Text(f"[{timestamp}] {message}", color=color, font_family="JetBrains Mono", selectable=True)
         )
-        page.update()
+
+        if len(log_view.controls) % 5 == 0:
+            page.update()
 
     try:
         tts = Kokoro("models/tts/kokoro-v1.0.onnx", "models/tts/voices-v1.0.bin")
@@ -64,7 +86,7 @@ def ControlPage(page: ft.Page):
 
     # ── Document list ─────────────────────────────────────────────────────────
 
-    doc_list_view = ft.ListView(expand=True, scroll=ft.ScrollMode.AUTO)
+    doc_list_view = ft.ListView(expand=4, scroll=ft.ScrollMode.AUTO)
 
     def show_content(e, tile: ft.ListTile, row: dict):
         dialog = ft.AlertDialog(
@@ -74,31 +96,31 @@ def ControlPage(page: ft.Page):
                 code_theme=fce.CodeTheme.SOLARIZED_DARK,
                 expand=True,
                 read_only=True,
-                value=row["request_md"]
+                value=row.get("request", "")
             ),
             alignment=ft.Alignment.CENTER,
         )
         page.show_dialog(dialog)
     
     def mark_merge(e, tile: ft.ListTile, row: dict):
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            UPDATE requests 
-            SET status_merged = ? 
-            WHERE id = ?
-        ''', (1, int(row["id"])))
+        supabase = get_supabase()
+        if not supabase:
+            page.show_dialog(ft.SnackBar(ft.Text("Database connection error.")))
+            return
 
-        page.pop_dialog()
-        
-        if cursor.rowcount == 0:
-            page.show_dialog(ft.SnackBar(ft.Text("Failed to update nonexistent.")))
-        else:
-            page.show_dialog(ft.SnackBar(ft.Text(f"Success: Request {row["id"]} updated to status {row["id"]}.")))
+        try:
+            # Now calling the updated markdown RPC
+            response = supabase.rpc("mark_markdown_merged", {"p_id": int(row["id"])}).execute()
             
-        conn.commit()
-        conn.close()
+            page.pop_dialog()
+            
+            if response.data is True:
+                page.show_dialog(ft.SnackBar(ft.Text(f"Success: Document {row['id']} updated to merged.")))
+            else:
+                page.show_dialog(ft.SnackBar(ft.Text("Failed to update nonexistent row.")))
+        except Exception as ex:
+            page.pop_dialog()
+            page.show_dialog(ft.SnackBar(ft.Text(f"Error: {ex}")))
 
         retrieve_embeddings()
     
@@ -116,10 +138,15 @@ def ControlPage(page: ft.Page):
         page.show_dialog(modal_dialog)
 
     def add_tile(row: dict):
-        name = f"Entry: {info_type_mapping[row["info_type"]]} | {office_mapping[row["office"]]} | {target_mapping[row["target"]]}"
+        info_type = row.get("info_type", "")
+        office = row.get("office", "")
+        target = row.get("target", "")
+        status_merged = bool(row.get("status", 0))
+
+        name = f"Entry: {info_type_mapping.get(info_type, 'Unknown')} | {office_mapping.get(office, 'Unknown')} | {target_mapping.get(target, 'Unknown')}"
         tile = ft.ListTile(
             title=ft.Text(name, weight=ft.FontWeight.BOLD),
-            subtitle=ft.Text("Merged" if bool(row["status_merged"]) else "Waiting"),
+            subtitle=ft.Text("Merged" if status_merged else "Waiting"),
             leading=ft.Icon(ft.Icons.FOLDER_OUTLINED),
         )
 
@@ -131,7 +158,7 @@ def ControlPage(page: ft.Page):
         controls = [view_btn]
         width = 32
 
-        if not bool(row["status_merged"]):
+        if not status_merged:
             controls.append(
                 ft.IconButton(
                     icon=ft.Icons.MERGE_OUTLINED,
@@ -145,31 +172,31 @@ def ControlPage(page: ft.Page):
 
     def retrieve_embeddings(e = None):
         doc_list_view.controls = []
-        conn = sqlite3.connect(db_path)
+        supabase = get_supabase()
         
-        conn.row_factory = sqlite3.Row 
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT * FROM requests 
-            ORDER BY status_merged ASC, id DESC
-        ''')
-        
-        results = cursor.fetchall()
-        conn.close()
-        
-        for row in results:
-            result = dict(row)
-            add_tile(result)
+        if not supabase:
+            write_log("Failed to load documents: Supabase connection failed.", is_error=True)
+            return
+            
+        try:
+            # Now calling the updated markdown RPC
+            response = supabase.rpc("get_all_markdowns").execute()
+            results = response.data
+            
+            for row in results:
+                add_tile(row)
+                
+            page.update()
+        except Exception as ex:
+            write_log(f"Error retrieving from Supabase: {ex}", is_error=True)
 
     # ── Ready check ───────────────────────────────────────────────────────────
 
     def check_ready():
         vlm_ready = False
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(1.0) # 1 second time out
+            s.settimeout(1.0)
             try:
-                # connect_ex returns 0 if the connection was successful
                 result = s.connect_ex(('127.0.0.1', int(vlm_port_tf.value)))
                 if result == 0:
                     vlm_ready = True
@@ -179,13 +206,18 @@ def ControlPage(page: ft.Page):
                     write_log(f"VLM is NOT ready.")
             except Exception as e:
                 vlm_ready = False
-                write_log(f"VLM is ready: {e}")
+                write_log(f"VLM check error: {e}")
 
         ready = all([
             webpage_port_tf.value,
             vlm_port_tf.value,
             provenance_port_tf.value,
             avatar_port_tf.value,
+            top_k_tf.value,
+            initial_retrieval_k_tf.value,
+            wakeword_thresh_tf.value,
+            stt_silence_thresh_tf.value,
+            minimum_audio_level_tf.value,
             len(doc_list_view.controls) > 0,
             vlm_ready
         ])
@@ -195,7 +227,6 @@ def ControlPage(page: ft.Page):
     # ── Server management ─────────────────────────────────────────────────────
 
     def _stream_output(name: str, proc: subprocess.Popen, color: str):
-        """Read stdout/stderr from a subprocess and pipe to the log view."""
         for line in iter(proc.stdout.readline, ""):
             line = line.rstrip()
             if line:
@@ -206,14 +237,11 @@ def ControlPage(page: ft.Page):
                         color=color,
                         font_family="JetBrains Mono",
                         size=12,
+                        selectable=True
                     )
                 )
-                # Throttle UI updates to avoid flooding
                 if len(log_view.controls) % 5 == 0:
-                    try:
-                        page.update()
-                    except Exception:
-                        pass
+                    page.update()
         try:
             page.update()
         except Exception:
@@ -223,40 +251,40 @@ def ControlPage(page: ft.Page):
         global _processes, _log_threads
         _log_threads.clear()
 
+        print("")
+
+        os.environ["PROVENANCE_PORT"] = str(provenance_port_tf.value)
+
         servers = [
             {
                 "name": "KIOSK",
                 "color": "#74c0fc",
-                # ---> NEW: Point to our custom HTTPS script <---
                 "cmd": [
                     "./.venv/Scripts/python.exe", "scripts/https_kiosk.py",
                     webpage_port_tf.value,
-                    "--directory", f"{os.path.join(os.getcwd(), 'avatar')}"
+                    f"{os.path.join(os.getcwd(), 'avatar_aang')}"
                 ],
             },
             {
                 "name": "AVATAR",
                 "color": "#a9e34b",
-                "cmd": ["./.venv/Scripts/python.exe", "scripts/assistant/avatar.py", "--port", avatar_port_tf.value],
-            },
-            {
-                "name": "PROVENANCE",
-                "color": "#ffd43b",
-                "cmd": [
-                    "./.venv/Scripts/uvicorn.exe", "server:app",
-                    "--host", "0.0.0.0",
-                    "--port", provenance_port_tf.value,
-                    "--app-dir", f"{os.path.join(os.getcwd(), 'scripts', 'provenance_checker')}",
-                    # ---> NEW: Add the SSL certificates here <---
-                    "--ssl-keyfile", "key.pem",
-                    "--ssl-certfile", "cert.pem"
-                ],
+                "cmd": ["./.venv/Scripts/python.exe", "scripts/assistant/iris_server.py",
+                        "--port", avatar_port_tf.value, 
+                        "--api-key", os.getenv("GEMINI_API_KEY"),
+                        "--male-voice", male_voice_dd.value,
+                        "--female-voice", female_voice_dd.value,
+                        "--top-k", top_k_tf.value,
+                        "--initial-retrieval-k", initial_retrieval_k_tf.value,
+                        "--wakeword-threshold", wakeword_thresh_tf.value,
+                        "--stt-silence-threshold", stt_silence_thresh_tf.value,
+                        "--minimum-audio-level", minimum_audio_level_tf.value
+                    ],
             },
         ]
 
         for srv in servers:
             if srv.get("cmd") is None:
-                write_log(f"[{srv['name']}] {srv['note']}")
+                write_log(f"[{srv['name']}] {srv.get('note', '')}")
                 continue
 
             try:
@@ -305,7 +333,7 @@ def ControlPage(page: ft.Page):
             stop_servers()
 
     def update_index(e):
-        write_log("Starting safe database update... This may take a minute.")
+        write_log("Starting safe database update from Supabase... This may take a minute.")
         
         build_progress.visible = True
         build_button.disabled = True
@@ -313,24 +341,24 @@ def ControlPage(page: ft.Page):
         
         def _build_task():
             try:
-                # 1. Fetch from SQLite
-                conn = sqlite3.connect(db_path)
-                conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
-                cursor.execute("SELECT * FROM requests WHERE status_merged = 1")
-                rows = cursor.fetchall()
-                conn.close()
+                # 1. Fetch from Supabase
+                supabase = get_supabase()
+                if not supabase:
+                    write_log("Supabase credentials missing.", is_error=True)
+                    return
+                
+                write_log("Fetching merged markdowns from Supabase securely...")
+                response = supabase.rpc("get_merged_markdowns").execute()
+                rows = response.data
 
                 if not rows:
-                    write_log("No merged documents found to index.", is_error=True)
+                    write_log("No merged documents found in Supabase to index.", is_error=True)
                     return
 
-                # =========================================================
-                # NEW: Check LanceDB to see what has already been built
-                # =========================================================
+                # Check LanceDB
                 lance_db_path = os.getenv("LANCEDB_URL")
                 db = lancedb.connect(lance_db_path)
-                table_name = "batstateu_rag_nomic"
+                table_name = "batstateu_info"
 
                 df_old = None
                 existing_doc_ids = set()
@@ -338,72 +366,204 @@ def ControlPage(page: ft.Page):
                 if table_name in db.table_names():
                     table = db.open_table(table_name)
                     df_old = table.to_pandas()
-                    
                     if "doc_id" in df_old.columns:
-                        # Grab all the unique doc_ids currently in LanceDB
                         existing_doc_ids = set(df_old['doc_id'].fillna('').astype(str).unique())
 
-                # Filter the rows: Only keep documents that are NOT in LanceDB yet
+                # Filter for new/updated documents
                 rows_to_build = [r for r in rows if str(r["id"]) not in existing_doc_ids]
 
                 if not rows_to_build:
                     write_log("✅ All merged documents are already indexed. Nothing new to build!")
                     return
 
-                write_log(f"Found {len(rows_to_build)} NEW merged documents. Chunking...")
+                write_log(f"Found {len(rows_to_build)} NEW merged documents. Processing with Docling...")
                 
-                # =========================================================
+                # ==========================================
+                # 2. Advanced Docling Extraction & Chunking
+                # ==========================================
                 
-                # 2. Chunking
-                embedder = HuggingFaceEmbeddings(
-                    model_name="nomic-ai/nomic-embed-text-v1.5",
-                    model_kwargs={'device': 'cpu', 'trust_remote_code': True}
+                # A. Enable Table Structure Recognition
+                pipeline_options = PdfPipelineOptions()
+                pipeline_options.do_table_structure = True
+                pipeline_options.table_structure_options = TableStructureOptions(mode="accurate")
+                
+                converter = DocumentConverter(
+                    format_options={
+                        InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+                    }
                 )
-                chunker = SemanticChunker(embedder)
+                
+                # C. Tune the Hybrid Chunker with Overlap
+                nomic_tokenizer = AutoTokenizer.from_pretrained("nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True)
+                chunker = HybridChunker(
+                    tokenizer=nomic_tokenizer, 
+                    max_tokens=512, 
+                    merge_peers=True,
+                    overlap_tokens=64  # CRITICAL: Prevents cutting thoughts in half
+                )
                 
                 new_chunks = []
+                temp_files = []
+                file_metadata = {}
                 
-                # Iterate ONLY over the new rows
+                # Prepare temporary files for multiprocessing
                 for row in rows_to_build:
-                    md_text = row["request_md"]
+                    md_text = row.get("request", "")
                     doc_id_str = str(row["id"])
                     
                     meta = {
                         "doc_id": doc_id_str,
-                        "source": info_type_mapping.get(row["info_type"], "Unknown"),
-                        "office": office_mapping.get(row["office"], "Unknown"),
-                        "target": target_mapping.get(row["target"], "Unknown")
+                        "source": info_type_mapping.get(row.get("info_type"), "Unknown"),
+                        "office": office_mapping.get(row.get("office"), "Unknown"),
+                        "target": target_mapping.get(row.get("target"), "Unknown")
                     }
-                    new_chunks.extend(chunker.create_documents([md_text], metadatas=[meta]))
 
-                write_log(f"Generated {len(new_chunks)} new chunks. Embedding them now...")
+                    temp_md = tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False, encoding='utf-8')
+                    temp_md.write(md_text)
+                    temp_md.close() # Close to allow Docling to open it safely
 
-                # 3. Generate vectors manually ONLY for the new chunks
-                texts = [chunk.page_content for chunk in new_chunks]
-                vectors = embedder.embed_documents(texts)
-                
-                new_records = []
-                for i, chunk in enumerate(new_chunks):
-                    record = {
-                        "vector": vectors[i],
-                        "text": chunk.page_content,
-                    }
-                    record.update(chunk.metadata) # Add metadata fields
-                    new_records.append(record)
+                    temp_files.append(temp_md.name)
+                    file_metadata[temp_md.name] = (doc_id_str, meta)
 
-                # 4. Safe Pandas Merge
-                if df_old is not None:
-                    write_log("Merging new records with existing database...")
-                    df_new = pd.DataFrame(new_records)
+                try:
+                    # B. Batch Document Processing
+                    write_log(f"Running batch conversion on {len(temp_files)} files...")
                     
-                    # Simply concat the new records to the old ones (no overlaps exist because we filtered them)
-                    merged_df = pd.concat([df_old, df_new], ignore_index=True)
-                    db.create_table(table_name, data=merged_df, mode="overwrite")
-                else:
-                    write_log("Creating new database table...")
-                    db.create_table(table_name, data=new_records)
+                    # Removed num_threads. Added raises_on_error=False so if one file fails, 
+                    # it doesn't crash the entire ingestion batch.
+                    conv_results = list(converter.convert_all(temp_files, raises_on_error=False))
+
+                    # Chunk the results
+                    for i, conv_result in enumerate(conv_results):
+                        doc_id_str, meta = file_metadata[temp_files[i]]
+                        chunk_iter = chunker.chunk(conv_result.document)
+
+                        for c_idx, chunk in enumerate(chunk_iter):
+                            new_chunks.append({
+                                "chunk_id": f"{doc_id_str}_c{c_idx}", 
+                                "text": chunk.text,
+                                **meta
+                            })
+                finally:
+                    # Clean up temp files
+                    for f in temp_files:
+                        if os.path.exists(f):
+                            os.remove(f)
+
+                write_log(f"Generated {len(new_chunks)} hybrid chunks. Initializing NGARAG Pipeline...")
+
+                # ==========================================
+                # 3. Initialize Models
+                # ==========================================
+                write_log("Loading Embedding Model...")
+                embedder = HuggingFaceEmbeddings(
+                    model_name="nomic-ai/nomic-embed-text-v1.5",
+                    model_kwargs={'device': 'cpu', 'trust_remote_code': True}
+                )
                 
-                write_log("✅ Database updated! Your other information was preserved.")
+                write_log("Loading NLI Gatekeeper...")
+                gatekeeper = CrossEncoder("cross-encoder/nli-deberta-v3-small")
+                
+                write_log("Embedding chunks...")
+                texts = [chunk["text"] for chunk in new_chunks]
+                vectors = embedder.embed_documents([f"search_document: {t}" for t in texts])
+
+                # 4. Define Schema & Open Table
+                schema = pa.schema([
+                    pa.field("chunk_id", pa.string()),
+                    pa.field("text", pa.string()),
+                    pa.field("vector", pa.list_(pa.float32(), 768)),
+                    pa.field("doc_id", pa.string()),
+                    pa.field("source", pa.string()),
+                    pa.field("office", pa.string()),
+                    pa.field("target", pa.string())
+                ])
+
+                if table_name in db.table_names():
+                    table = db.open_table(table_name)
+                else:
+                    write_log("Creating new LanceDB table...")
+                    table = db.create_table(table_name, schema=schema, mode="create")
+
+                # ==========================================
+                # 5. Batched NGARAG Intelligent Upsert
+                # ==========================================
+                write_log("Executing NLI-Gated Insertion (Batched for Performance)...")
+                appended_count, dropped_count, overwritten_count = 0, 0, 0
+                similarity_threshold = 0.6  
+                
+                records_to_add = []
+                ids_to_delete = []
+
+                if len(table) == 0:
+                    # If DB is completely empty, append everything directly
+                    records_to_add = [{"vector": vectors[i], **c} for i, c in enumerate(new_chunks)]
+                    appended_count = len(records_to_add)
+                else:
+                    gatekeeper_pairs = []
+                    gatekeeper_meta = []
+
+                    # Pass 1: Vector Search Collection
+                    for i, chunk_data in enumerate(new_chunks):
+                        vector = vectors[i]
+                        record = chunk_data.copy()
+                        record["vector"] = vector
+
+                        results = table.search(vector).limit(1).to_pandas()
+
+                        if results.empty or results['_distance'][0] > similarity_threshold:
+                            records_to_add.append(record)
+                            appended_count += 1
+                        else:
+                            closest_match = results.iloc[0]
+                            # Queue for the Gatekeeper batch
+                            gatekeeper_pairs.append((closest_match['text'], chunk_data['text']))
+                            gatekeeper_meta.append({
+                                'old_id': closest_match['chunk_id'],
+                                'record': record
+                            })
+
+                    # Pass 2: Mass Matrix Prediction (Eliminates the O(N) bottleneck)
+                    if gatekeeper_pairs:
+                        scores = gatekeeper.predict(gatekeeper_pairs, batch_size=32)
+                        predictions = scores.argmax(axis=1)
+
+                        for pred, meta in zip(predictions, gatekeeper_meta):
+                            if pred == 1:
+                                dropped_count += 1
+                            elif pred == 0:
+                                ids_to_delete.append(meta['old_id'])
+                                records_to_add.append(meta['record'])
+                                overwritten_count += 1
+                            else:
+                                records_to_add.append(meta['record'])
+                                appended_count += 1
+
+                # Execute Database Mutations
+                if ids_to_delete:
+                    for old_id in ids_to_delete:
+                        table.delete(f"chunk_id = '{old_id}'")
+                        
+                if records_to_add:
+                    table.add(records_to_add)
+
+                write_log(f"NGARAG Complete: {appended_count} Appended, {dropped_count} Dropped, {overwritten_count} Overwritten.")
+
+                # ==========================================
+                # 6. Database Indexing & Optimizations
+                # ==========================================
+                write_log("Building Full-Text Search (FTS) index...")
+                table.create_fts_index("text", replace=True)
+                
+                # Advanced Vector Indexing (IVF-PQ) - Triggers once DB is sufficiently large
+                if len(table) > 1000:
+                    try:
+                        write_log("Optimizing vector clusters (IVF-PQ)...")
+                        table.create_index(metric="L2", vector_column_name="vector", num_partitions=256, num_sub_vectors=96)
+                    except Exception as idx_err:
+                        write_log(f"Vector index optimization skipped: {idx_err}")
+                
+                write_log("✅ Database updated and Hybrid Search is ready!")
 
             except Exception as exc:
                 write_log(f"Index rebuild failed: {exc}", is_error=True)
@@ -457,7 +617,7 @@ def ControlPage(page: ft.Page):
     male_voice_dd = ft.Dropdown(
         expand=True,
         border_color=ft.Colors.WHITE_54,
-        value="am_echo",
+        value="am_fenrir",
         options=[
             ft.DropdownOption(key="am_adam",    text="Adam"),
             ft.DropdownOption(key="am_echo",    text="Echo"),
@@ -480,7 +640,6 @@ def ControlPage(page: ft.Page):
         value="5050",
         border_color=ft.Colors.WHITE_54,
         expand=True,
-        height=80,
         on_change=lambda e: check_ready(),
     )
     vlm_port_tf = ft.TextField(
@@ -499,7 +658,44 @@ def ControlPage(page: ft.Page):
     )
     avatar_port_tf = ft.TextField(
         label="Avatar WebSocket Port",
-        value="8080",
+        value="7040",
+        border_color=ft.Colors.WHITE_54,
+        expand=True,
+        on_change=lambda e: check_ready(),
+    )
+    top_k_tf = ft.TextField(
+        label="Top K",
+        value="5",
+        border_color=ft.Colors.WHITE_54,
+        expand=True,
+        on_change=lambda e: check_ready(),
+        tooltip="How many of the ranked relevant searches to provide to the VLM context?"
+    )
+    initial_retrieval_k_tf = ft.TextField(
+        label="Initial Retrieval K",
+        value="12",
+        border_color=ft.Colors.WHITE_54,
+        expand=True,
+        on_change=lambda e: check_ready(),
+        tooltip="How many relevant items to look for in the database?"
+    )
+    wakeword_thresh_tf = ft.TextField(
+        label="Wakeword Trigger Accuracy Threshold",
+        value="0.2",
+        border_color=ft.Colors.WHITE_54,
+        expand=True,
+        on_change=lambda e: check_ready(),
+    )
+    stt_silence_thresh_tf = ft.TextField(
+        label="STT Silence Threshold",
+        value="0.75",
+        border_color=ft.Colors.WHITE_54,
+        expand=True,
+        on_change=lambda e: check_ready(),
+    )
+    minimum_audio_level_tf = ft.TextField(
+        label="Minimum Audio Level",
+        value="1500",
         border_color=ft.Colors.WHITE_54,
         expand=True,
         on_change=lambda e: check_ready(),
@@ -540,10 +736,10 @@ def ControlPage(page: ft.Page):
                         padding=ft.Padding.symmetric(horizontal=16),
                         content=ft.Row(
                             controls=[
-                                ft.Text("Configuration", size=20, weight=ft.FontWeight.W_600, expand=True),
+                                ft.Text("Configuration", size=20, weight=ft.FontWeight.W_600, expand=6),
                                 ft.Row(
                                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                    expand=True,
+                                    expand=4,
                                     controls=[
                                         ft.Text("Embedding Documents", size=20, weight=ft.FontWeight.W_600),
                                         ft.Row([
@@ -564,35 +760,61 @@ def ControlPage(page: ft.Page):
                             expand=True,
                             controls=[
                                 # Left — config
-                                ft.Column(
-                                    spacing=16,
-                                    expand=True,
+                                ft.Row(
+                                    expand=6,
                                     controls=[
-                                        ft.Text("Ports", weight=ft.FontWeight.W_500),
-                                        ft.Container(
+                                        ft.Column(
+                                            spacing=16,
                                             expand=True,
-                                            content=ft.Column(
-                                                expand=True,
-                                                controls=[
-                                                    webpage_port_tf,
-                                                    vlm_port_tf,
-                                                    provenance_port_tf,
-                                                    avatar_port_tf,
-                                                ],
-                                            ),
+                                            controls=[
+                                                ft.Text("Ports", weight=ft.FontWeight.W_500),
+                                                ft.Container(
+                                                    expand=True,
+                                                    content=ft.Column(
+                                                        expand=True,
+                                                        controls=[
+                                                            webpage_port_tf,
+                                                            vlm_port_tf,
+                                                            provenance_port_tf,
+                                                            avatar_port_tf,
+                                                        ],
+                                                    ),
+                                                ),
+                                                ft.Row([
+                                                    ft.Row(expand=True, controls=[
+                                                        ft.Text("Female Voice", weight=ft.FontWeight.W_500, expand=True),
+                                                        ft.IconButton(ft.Icons.PLAY_ARROW, on_click=lambda e: play_voice(True)),
+                                                    ]),
+                                                    ft.Row(expand=True, controls=[
+                                                        ft.Text("Male Voice", weight=ft.FontWeight.W_500, expand=True),
+                                                        ft.IconButton(ft.Icons.PLAY_ARROW, on_click=lambda e: play_voice(False)),
+                                                    ]),
+                                                ]),
+                                                ft.Container(content=ft.Row(controls=[female_voice_dd, male_voice_dd])),
+                                            ],
                                         ),
-                                        ft.Row([
-                                            ft.Row(expand=True, controls=[
-                                                ft.Text("Female Voice", weight=ft.FontWeight.W_500, expand=True),
-                                                ft.IconButton(ft.Icons.PLAY_ARROW, on_click=lambda e: play_voice(True)),
-                                            ]),
-                                            ft.Row(expand=True, controls=[
-                                                ft.Text("Male Voice", weight=ft.FontWeight.W_500, expand=True),
-                                                ft.IconButton(ft.Icons.PLAY_ARROW, on_click=lambda e: play_voice(False)),
-                                            ]),
-                                        ]),
-                                        ft.Container(content=ft.Row(controls=[female_voice_dd, male_voice_dd])),
-                                    ],
+                                        ft.Column(
+                                            spacing=16,
+                                            expand=True,
+                                            controls=[
+                                                ft.Text("RAG Parameters", weight=ft.FontWeight.W_500),
+                                                ft.Container(
+                                                    expand=True,
+                                                    content=ft.Column(
+                                                        expand=True,
+                                                        controls=[
+                                                            initial_retrieval_k_tf,
+                                                            top_k_tf,
+                                                            ft.Text("Model Sensitivity", weight=ft.FontWeight.W_500),
+                                                            wakeword_thresh_tf,
+                                                            stt_silence_thresh_tf,
+                                                            minimum_audio_level_tf
+                                                        ],
+                                                    ),
+                                                ),
+                                            ],
+                                        ),
+                                    ]
                                 ),
                                 # Right — documents
                                 doc_list_view,

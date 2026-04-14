@@ -1,54 +1,95 @@
 import flet as ft
-import sqlite3
+from supabase import create_client, Client
 import os
 
 def LoginPage(page: ft.Page):
-    db_path = os.getenv("DATABASE_URL")
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_KEY")
+    supabase: Client = create_client(supabase_url, supabase_key)
+    
     async def push_to_ctrl():
         await page.push_route("/control")
     
-    def login(univ_code, password):
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT from_ict 
-            FROM users 
-            WHERE user_code = ? AND password = ?
-        ''', (univ_code, password))
-        
-        match = cursor.fetchone()
-        conn.close()
-    
-        if match:
-            return True, bool(match[0])
-        else:
-            return False, None
-    
     async def try_login(e):
-        result, from_ict = login(univ_code_tf.value, password_tf.value)
-        if result:
-            if from_ict:
-                await push_to_ctrl()
-            else:
+        input_code = univ_code_tf.value
+        input_password = password_tf.value
+        
+        login_button.disabled = True
+        page.update()
+
+        try:
+            # STEP 1: Call the secure RPC function to fetch email
+            rpc_response = supabase.rpc(
+                "get_email_by_code", 
+                {"p_user_code": input_code}
+            ).execute()
+            
+            user_email = rpc_response.data
+            
+            if not user_email:
                 dialog = ft.AlertDialog(
                     title=ft.Text("Cannot log in."),
-                    content=ft.Text("Only ICT can check for merge requests!"),
+                    content=ft.Text("User Code not found!"),
                     alignment=ft.Alignment.CENTER,
                     title_padding=ft.Padding.all(25),
                 )
-
                 page.show_dialog(dialog)
-        else:
+                enable_login(None)
+                return
+
+            # STEP 2: Authenticate using the retrieved email
+            auth_response = supabase.auth.sign_in_with_password({
+                "email": user_email,
+                "password": input_password
+            })
+            
+            # Save the authentication tokens so other pages can use them
+            page.session.store.set("access_token", auth_response.session.access_token)
+            page.session.store.set("refresh_token", auth_response.session.refresh_token)
+
+            # STEP 3: Verify the user is from ICT using the new secure RPC
+            ict_response = supabase.rpc(
+                "check_if_ict", 
+                {"p_user_code": input_code}
+            ).execute()
+            
+            # The RPC returns True, False, or None
+            is_ict = True if ict_response.data is True else False
+
+            if is_ict:
+                await push_to_ctrl()
+            else:
+                # Clean up session since they aren't authorized for this app
+                supabase.auth.sign_out()
+                page.session.store.remove("access_token")
+                page.session.store.remove("refresh_token")
+                
+                dialog = ft.AlertDialog(
+                    title=ft.Text("Access Denied."),
+                    content=ft.Text("Only ICT can access the Control Center!"),
+                    alignment=ft.Alignment.CENTER,
+                    title_padding=ft.Padding.all(25),
+                )
+                page.show_dialog(dialog)
+                enable_login(None)
+
+        except Exception as ex:
+            print(ex)
+            error_message = str(ex)
+            display_message = "Please check your credentials!"
+            
+            if "Invalid login credentials" in error_message:
+                display_message = "Incorrect Password!"
+                
             dialog = ft.AlertDialog(
                 title=ft.Text("Cannot log in."),
-                content=ft.Text("Please check your credentials!"),
+                content=ft.Text(display_message),
                 alignment=ft.Alignment.CENTER,
                 title_padding=ft.Padding.all(25),
             )
-
             page.show_dialog(dialog)
-    
+            enable_login(None)
+
     def enable_login(e):
         if all([
             univ_code_tf.value,

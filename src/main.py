@@ -8,10 +8,10 @@ load_dotenv()
 async def main(page: ft.Page):
     page.title = "IRIS Control Center"
     page.theme_mode = ft.ThemeMode.DARK
-    page.window.width = 960
+    page.window.width = 1280
     page.window.height = 800
-    page.window.resizable = False
-    page.window.maximizable = False
+    # page.window.resizable = False
+    # page.window.maximizable = False
     page.views[0].padding = ft.Padding.all(0)
 
     def route_change():
@@ -31,6 +31,8 @@ async def main(page: ft.Page):
 
     page.on_route_change = route_change
     page.on_view_pop = view_pop
+
+    # page.route = "/control"
     
     route_change()
     await page.window.center()
