@@ -54,6 +54,18 @@ def ControlPage(page: ft.Page):
 
         if len(log_view.controls) % 5 == 0:
             page.update()
+    
+    def get_local_ip():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # Port and address don't need to be reachable
+            s.connect(('8.8.8.8', 1))
+            local_ip = s.getsockname()[0]
+        except Exception:
+            local_ip = '127.0.0.1'
+        finally:
+            s.close()
+        return local_ip
 
     try:
         tts = Kokoro("models/tts/kokoro-v1.0.onnx", "models/tts/voices-v1.0.bin")
@@ -215,7 +227,7 @@ def ControlPage(page: ft.Page):
             avatar_port_tf.value,
             top_k_tf.value,
             initial_retrieval_k_tf.value,
-            wakeword_thresh_tf.value,
+            vlm_alias_tf.value,
             stt_silence_thresh_tf.value,
             minimum_audio_level_tf.value,
             len(doc_list_view.controls) > 0,
@@ -255,6 +267,12 @@ def ControlPage(page: ft.Page):
 
         os.environ["PROVENANCE_PORT"] = str(provenance_port_tf.value)
 
+        local_ip = get_local_ip()
+
+        os.environ["LOCAL_IP"] = local_ip
+        os.environ["VLM_ALIAS"] = vlm_alias_tf.value
+        os.environ["VLM_PORT"] = vlm_port_tf.value
+
         servers = [
             {
                 "name": "KIOSK",
@@ -275,12 +293,15 @@ def ControlPage(page: ft.Page):
                         "--female-voice", female_voice_dd.value,
                         "--top-k", top_k_tf.value,
                         "--initial-retrieval-k", initial_retrieval_k_tf.value,
-                        "--wakeword-threshold", wakeword_thresh_tf.value,
+                        "--vlm-alias", vlm_alias_tf.value,
                         "--stt-silence-threshold", stt_silence_thresh_tf.value,
-                        "--minimum-audio-level", minimum_audio_level_tf.value
+                        "--minimum-audio-level", minimum_audio_level_tf.value,
+                        "--local-ip", local_ip
                     ],
             },
         ]
+
+        successes = 0
 
         for srv in servers:
             if srv.get("cmd") is None:
@@ -288,6 +309,7 @@ def ControlPage(page: ft.Page):
                 continue
 
             try:
+                write_log(f"Starting {srv["name"]}")
                 proc = subprocess.Popen(
                     srv["cmd"],
                     stdout=subprocess.PIPE,
@@ -308,8 +330,13 @@ def ControlPage(page: ft.Page):
                 t.start()
                 _log_threads.append(t)
 
+                successes += 1
+
             except FileNotFoundError as exc:
                 write_log(f"[{srv['name']}] Failed to start: {exc}", is_error=True)
+
+        if successes == len(servers):
+            write_log(f"Open the webpage at: https://{local_ip}:{webpage_port_tf.value}")
 
     def stop_servers():
         for name, proc in _processes.items():
@@ -679,9 +706,9 @@ def ControlPage(page: ft.Page):
         on_change=lambda e: check_ready(),
         tooltip="How many relevant items to look for in the database?"
     )
-    wakeword_thresh_tf = ft.TextField(
-        label="Wakeword Trigger Accuracy Threshold",
-        value="0.2",
+    vlm_alias_tf = ft.TextField(
+        label="VLM Alias (See LM Studio)",
+        value="gemma-4-e2b-it",
         border_color=ft.Colors.WHITE_54,
         expand=True,
         on_change=lambda e: check_ready(),
@@ -805,8 +832,8 @@ def ControlPage(page: ft.Page):
                                                         controls=[
                                                             initial_retrieval_k_tf,
                                                             top_k_tf,
+                                                            vlm_alias_tf,
                                                             ft.Text("Model Sensitivity", weight=ft.FontWeight.W_500),
-                                                            wakeword_thresh_tf,
                                                             stt_silence_thresh_tf,
                                                             minimum_audio_level_tf
                                                         ],
